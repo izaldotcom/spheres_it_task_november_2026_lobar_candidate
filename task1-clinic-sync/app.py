@@ -87,20 +87,15 @@ def record_visit(conn, visit, patient_id: str) -> str:
 # ── Dispensing ───────────────────────────────────────────────────────────
 
 def dispense_medicine(conn, record, patient_id: str):
-    row = conn.execute(
-        "SELECT stock FROM medicines WHERE id = ?",
-        (record.medicine_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"Medicine {record.medicine_id} not found")
-
-    current_stock = row["stock"]
-    new_stock = current_stock - record.quantity
-
-    conn.execute(
-        "UPDATE medicines SET stock = ? WHERE id = ?",
-        (new_stock, record.medicine_id),
+    # Fix 3: Race Condition. Use atomic update directly in the database.
+    # It will only succeed (rowcount > 0) if the ID exists AND the stock is sufficient.
+    cursor = conn.execute(
+        "UPDATE medicines SET stock = stock - ? WHERE id = ? AND stock >= ?",
+        (record.quantity, record.medicine_id, record.quantity),
     )
+    
+    if cursor.rowcount == 0:
+        raise ValueError(f"Insufficient stock or medicine not found for {record.medicine_id}")
 
     disp_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -110,9 +105,8 @@ def dispense_medicine(conn, record, patient_id: str):
         (disp_id, record.visit_id, patient_id, record.medicine_id, record.quantity, now),
     )
     logger.info(
-        "Dispensed %d x %s to patient %s (NIK: %s), stock: %d -> %d",
-        record.quantity, record.medicine_id, patient_id,
-        record.patient_nik, current_stock, new_stock,
+        "Dispensed %d x %s to patient %s (NIK: %s)",
+        record.quantity, record.medicine_id, patient_id, record.patient_nik
     )
 
 
@@ -138,9 +132,10 @@ def create_bill_and_claim(conn, bill, patient_id: str):
 # ── Claim submission ────────────────────────────────────────────────────
 
 def submit_claim_to_api(claim_id: str, claim_amount: float, patient_id: str) -> dict | None:
-    token = get_token()
-
+    global _token # Fix 2: Declare global so we can reset the token if it expires
+    
     for attempt in range(3):
+        token = get_token()
         try:
             resp = httpx.post(
                 f"{CLAIM_API_URL}/claims",
@@ -152,11 +147,18 @@ def submit_claim_to_api(claim_id: str, claim_amount: float, patient_id: str) -> 
                 },
                 timeout=10.0,
             )
+            
+            # Fix 2: Handle Token Expiry (401 Unauthorized)
+            if resp.status_code == 401:
+                logger.warning("Token expired (401), clearing token and retrying...")
+                _token = None # Clear the token so get_token() fetches a new one in the next iteration
+                continue
+                
             resp.raise_for_status()
             return resp.json()
 
         except Exception as e:
-            logger.warning("Claim submission issue for %s: %s", claim_id, e)
+            logger.warning("Claim submission issue for %s (attempt %d): %s", claim_id, attempt + 1, e)
             time.sleep(1)
 
     return None
@@ -178,14 +180,20 @@ def sync_pending_claims():
         for row in rows:
             try:
                 result = submit_claim_to_api(row["id"], row["claim_amount"], row["patient_id"])
-                logger.info("Claim %s submitted, result: %s", row["id"], result)
+                
+                # Fix 1: Phantom Claims. ONLY update status if the API returns a result (not failed/timeout)
+                if result:
+                    logger.info("Claim %s submitted, result: %s", row["id"], result)
+                    conn.execute(
+                        "UPDATE claims SET synced = 1, status = 'synced', submitted_at = ? WHERE id = ?",
+                        (datetime.now().isoformat(), row["id"]),
+                    )
+                else:
+                    logger.warning("Claim %s failed to submit, skipping update", row["id"])
+                    
             except Exception as e:
                 logger.warning("Error syncing claim %s: %s", row["id"], e)
 
-            conn.execute(
-                "UPDATE claims SET synced = 1, status = 'synced', submitted_at = ? WHERE id = ?",
-                (datetime.now().isoformat(), row["id"]),
-            )
         conn.commit()
 
 
